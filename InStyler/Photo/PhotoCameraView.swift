@@ -3,6 +3,8 @@
 //  InStyler
 //
 //  Created by Denis Dzyuba on 5/3/2025.
+//  Based on the code from this Apple tutorial:
+//  doc://com.apple.documentation/tutorials/sample-apps/CapturingPhotos-BrowsePhotos
 //
 import SwiftUI
 
