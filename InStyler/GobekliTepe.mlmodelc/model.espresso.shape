@@ -1,0 +1,212 @@
+{
+  "layer_shapes" : {
+    "transformer__mulscalar0_output_constant_in_bias" : {
+      "k" : 3,
+      "w" : 1,
+      "n" : 1,
+      "h" : 1
+    },
+    "transformer_residualblock2_instancenorm1__fwd" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer_residualblock0_instancenorm1__fwd" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer_residualblock3_activation0" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer_residualblock0__plus0" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer_activation2" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer_residualblock4_activation0" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "image" : {
+      "k" : 3,
+      "w" : 512,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 512
+    },
+    "transformer_residualblock1__plus0" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer_upsampling1" : {
+      "k" : 32,
+      "w" : 512,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 512
+    },
+    "transformer__mulscalar0_output_mul_out" : {
+      "k" : 3,
+      "w" : 512,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 512
+    },
+    "transformer_residualblock2__plus0" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer_residualblock3_instancenorm1__fwd" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer_residualblock1_instancenorm1__fwd" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer_activation3" : {
+      "k" : 32,
+      "w" : 256,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 256
+    },
+    "stylizedImage" : {
+      "k" : 3,
+      "w" : 512,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 512
+    },
+    "transformer_residualblock3__plus0" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer_residualblock2_activation0" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer_residualblock1_activation0" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer__mulscalar0_output_constant_in_scale" : {
+      "k" : 3,
+      "w" : 1,
+      "n" : 1,
+      "h" : 1
+    },
+    "transformer_activation4" : {
+      "k" : 32,
+      "w" : 512,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 512
+    },
+    "transformer_residualblock4__plus0" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "image__fix__underflow_____transformer_encode_1_conv" : {
+      "k" : 3,
+      "w" : 512,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 512
+    },
+    "transformer_residualblock4_instancenorm1__fwd" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    },
+    "transformer_activation0" : {
+      "k" : 32,
+      "w" : 512,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 512
+    },
+    "transformer_conv5_fwd" : {
+      "k" : 3,
+      "w" : 512,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 512
+    },
+    "transformer_activation5" : {
+      "k" : 3,
+      "w" : 512,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 512
+    },
+    "transformer_upsampling0" : {
+      "k" : 32,
+      "w" : 256,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 256
+    },
+    "transformer_activation1" : {
+      "k" : 32,
+      "w" : 256,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 256
+    },
+    "transformer_residualblock0_activation0" : {
+      "k" : 32,
+      "w" : 128,
+      "n" : 1,
+      "_rank" : 4,
+      "h" : 128
+    }
+  }
+}
