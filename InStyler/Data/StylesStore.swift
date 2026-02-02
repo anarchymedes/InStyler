@@ -51,7 +51,7 @@ private func setupGLobalScaledBuffer()->CVPixelBuffer?{
     return scaledBuffer
 }
 
-nonisolated(unsafe) let context = CIContext()
+let context = CIContext()
 nonisolated(unsafe) var scaledBuffer = setupGLobalScaledBuffer()
 
 func pickModel(chosenStyle: Int?, forImages: Bool = true)->MLModel {

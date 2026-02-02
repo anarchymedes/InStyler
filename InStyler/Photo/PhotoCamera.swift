@@ -21,10 +21,6 @@ class PhotoCamera: NSObject, @unchecked Sendable {
     private var videoOutput: AVCaptureVideoDataOutput?
     private var sessionQueue: DispatchQueue!
     
-    //Dear Apple, PLEASE provide a working example of how to use maxPhotoDimensions instead of isHighResolutionCaptureEnabled!
-    //private let MaxDimensionsLandscape: CMVideoDimensions = CMVideoDimensions(width: 12096, height: 9072)
-    //private let MaxDimensionsPortrait: CMVideoDimensions = CMVideoDimensions(width: 12096, height: 9072)
-
     private var allCaptureDevices: [AVCaptureDevice] {
         AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInTrueDepthCamera, .builtInDualCamera, .builtInDualWideCamera, .builtInWideAngleCamera, .builtInDualWideCamera], mediaType: .video, position: .unspecified).devices
     }
@@ -90,10 +86,14 @@ class PhotoCamera: NSObject, @unchecked Sendable {
     
     var isPreviewPaused = false
     
+    // Size (in points) of the preview surface; update this from the hosting view.
+    // Defaults to 1080x1920 portrait if not set.
+    var previewTargetSize: CGSize = CGSize(width: 1080, height: 1920)
+    
     lazy var previewStream: AsyncStream<CIImage> = {
         AsyncStream { continuation in
             addToPreviewStream = { ciImage in
-                nonisolated(unsafe) let ciImageNoError = ciImage
+                let ciImageNoError = ciImage
                 if !self.isPreviewPaused {
                     continuation.yield(ciImageNoError)
                 }
@@ -171,10 +171,6 @@ class PhotoCamera: NSObject, @unchecked Sendable {
         self.photoOutput = photoOutput
         self.videoOutput = videoOutput
         
-        photoOutput.isHighResolutionCaptureEnabled = true // It may be TEN TIMES deprecated, but if it's not set, the app CRASHES!!!
-        //let orientation = self.videoOrientation()
-        // This CRASHES the app: HOW do I use maxPhotoDimensions instead of isHighResolutionCaptureEnabled??? VERY frustrating!
-        //photoOutput.maxPhotoDimensions = orientation.1 ? self.MaxDimensionsLandscape : self.MaxDimensionsPortrait
         photoOutput.maxPhotoQualityPrioritization = .quality
         
         updateVideoOutputConnection()
@@ -243,6 +239,46 @@ class PhotoCamera: NSObject, @unchecked Sendable {
                 videoOutputConnection.isVideoMirrored = isUsingFrontCaptureDevice
             }
         }
+    }
+    
+    // Apply rotation/mirroring and aspect-fit to target preview size
+    private func orientedPreviewImage(_ image: CIImage, angleDegrees: CGFloat, mirrored: Bool, targetSize: CGSize) -> CIImage {
+        var ci = image
+        // Rotate around center
+        let center = CGPoint(x: ci.extent.midX, y: ci.extent.midY)
+        let radians = -angleDegrees * .pi / 180
+        ci = ci
+            .transformed(by: CGAffineTransform(translationX: -center.x, y: -center.y))
+            .transformed(by: CGAffineTransform(rotationAngle: radians))
+            .transformed(by: CGAffineTransform(translationX: center.x, y: center.y))
+
+        // Mirror horizontally if needed
+        if mirrored {
+            ci = ci
+                .transformed(by: CGAffineTransform(translationX: ci.extent.width, y: 0))
+                .transformed(by: CGAffineTransform(scaleX: -1, y: 1))
+        }
+
+        // Aspect-fit into target size
+        let sx = targetSize.width / max(ci.extent.width, 1)
+        let sy = targetSize.height / max(ci.extent.height, 1)
+        let scale = min(sx, sy)
+        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+
+        // Center within target rect (letterbox/pillarbox)
+        let tx = (targetSize.width - scaled.extent.width) * 0.5
+        let ty = (targetSize.height - scaled.extent.height) * 0.5
+        return scaled.transformed(by: CGAffineTransform(translationX: tx, y: ty))
+    }
+    
+    private func bestMaxPhotoDimensions(for device: AVCaptureDevice) -> CMVideoDimensions {
+        let format = device.activeFormat
+        let desc = format.formatDescription
+        let dims = CMVideoFormatDescriptionGetDimensions(desc)
+        // Optionally clamp to a ceiling to control memory usage
+        let maxWidth = Int32(min(Int(dims.width), 4032))
+        let maxHeight = Int32(min(Int(dims.height), 4032))
+        return CMVideoDimensions(width: maxWidth, height: maxHeight)
     }
     
     func start() async {
@@ -319,21 +355,22 @@ class PhotoCamera: NSObject, @unchecked Sendable {
                 photoSettings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
             }
             
-            let isFlashAvailable = self.deviceInput?.device.isFlashAvailable ?? false
-            photoSettings.flashMode = isFlashAvailable ? .auto : .off
-            photoSettings.isHighResolutionPhotoEnabled = true // It may be TEN TIMES deprecated, but if it's not set, the app CRASHES!!!
             if let previewPhotoPixelFormatType = photoSettings.availablePreviewPhotoPixelFormatTypes.first {
                 photoSettings.previewPhotoFormat = [kCVPixelBufferPixelFormatTypeKey as String: previewPhotoPixelFormatType]
             }
             photoSettings.photoQualityPrioritization = .balanced
+
+            // Use maxPhotoDimensions instead of deprecated high-resolution flags
+            if let device = self.deviceInput?.device {
+                let dims = self.bestMaxPhotoDimensions(for: device)
+                photoSettings.maxPhotoDimensions = dims
+            }
             
             if let photoOutputVideoConnection = photoOutput.connection(with: .video) {
                 let orientation = self.videoOrientation()
                 if let angle = orientation.0, photoOutputVideoConnection.isVideoRotationAngleSupported(angle) {
                     photoOutputVideoConnection.videoRotationAngle = angle
                 }
-                // This CRASHES the app: HOW do I use maxPhotoDimensions instead of isHighResolutionCaptureEnabled??? VERY frustrating!
-                //photoSettings.maxPhotoDimensions = orientation.1 ? self.MaxDimensionsLandscape : self.MaxDimensionsPortrait
             }
             
             photoOutput.capturePhoto(with: photoSettings, delegate: self)
@@ -377,18 +414,14 @@ extension PhotoCamera: AVCaptureVideoDataOutputSampleBufferDelegate {
 //           let videoOrientation = videoOrientationFor(deviceOrientation) {
 //            connection.videoOrientation = videoOrientation
 //        }
-        let orientation = self.videoOrientation()
+        // Removed per-frame rotation from connection
         
-        if let angle = orientation.0, connection.isVideoRotationAngleSupported(angle){
-            connection.videoRotationAngle = angle
-        }
-
-        if let stylisedFrame = stylizeFrame(pixelBuffer) {
-            addToPreviewStream?(stylisedFrame)
-        }
-        else {
-            addToPreviewStream?(CIImage(cvPixelBuffer: pixelBuffer))
-        }
+        let orientation = self.videoOrientation()
+        let angle = orientation.0 ?? 0
+        let mirrored = self.isUsingFrontCaptureDevice
+        let baseImage = stylizeFrame(pixelBuffer) ?? CIImage(cvPixelBuffer: pixelBuffer)
+        let oriented = orientedPreviewImage(baseImage, angleDegrees: angle, mirrored: mirrored, targetSize: previewTargetSize)
+        addToPreviewStream?(oriented)
     }
 }
 
