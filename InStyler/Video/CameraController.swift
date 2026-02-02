@@ -58,6 +58,35 @@ class CameraController: NSObject, @unchecked Sendable {
     nonisolated(unsafe) private static var _instance: CameraController? = nil
     private var prepareQueue = DispatchQueue(label: "prepare")              // A serial queue on which we'll receive and process the frames
     private var assetWriteQueue = DispatchQueue(label: "assetWriterQueue")  // A serial queue on which we'll wait for the writer's availability and prepare the pixel buffer for each frame
+
+    // CI context for rendering
+    private let ciContext = CIContext(options: nil)
+
+    // Queued video sample carrying stylized buffer and timing
+    private struct QueuedVideoSample {
+        let pixelBuffer: CVPixelBuffer
+        let sampleBuffer: CMSampleBuffer
+        let previewImage: UIImage?
+    }
+    
+    // Bounded queues to decouple capture from encoding
+    private var videoQueue: [QueuedVideoSample] = []
+    private var audioQueue: [CMSampleBuffer] = []
+    private let videoQueueMaxCount = 90 // ~3 seconds at 30 fps
+    private let audioQueueMaxCount = 256
+
+    // Encoding control
+    private var encodingTimer: DispatchSourceTimer?
+    private var encodingActive = false
+
+    // Writer session start control
+    private var didStartSession = false
+    private var sessionStartPTS: CMTime = .invalid
+
+    // Timing
+    private var basePTS: CMTime = .zero
+    private var frameIndex: Int64 = 0
+    private var nominalFrameDuration: CMTime = CMTime(value: 1, timescale: 30)
     
     var didOutputNewImage: (UIImage) -> Void = {_ in }
     
@@ -146,7 +175,7 @@ class CameraController: NSObject, @unchecked Sendable {
             self.captureSession = AVCaptureSession()
         }
         
-        //MARK: - Configure capture device
+        //MARK: - Configure capture devices
         @Sendable func configureCaptureDevices() throws {
             let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: AVMediaType.video, position: useFront ? .front : .back)
             self.frontCamera = camera
@@ -211,7 +240,7 @@ class CameraController: NSObject, @unchecked Sendable {
                 try configureDeviceInputs()
                 
                 self.cameraOutput = AVCaptureVideoDataOutput()
-                self.cameraOutput!.alwaysDiscardsLateVideoFrames = true // To drop the frames we can't process on time
+                self.cameraOutput!.alwaysDiscardsLateVideoFrames = false // To avoid dropping frames we want to buffer
                 self.cameraOutput!.setSampleBufferDelegate(self, queue: DispatchQueue(label: "sample buffer"))
                 
                 self.mikeOutput = AVCaptureAudioDataOutput()
@@ -288,6 +317,7 @@ class CameraController: NSObject, @unchecked Sendable {
             isRecording = true
             
             setUpWriter()
+            startEncodingLoop()
         }
         #if DEBUG
         print(isRecording)
@@ -312,11 +342,25 @@ class CameraController: NSObject, @unchecked Sendable {
         
         prepareQueue.asyncAndWait {[unowned self] in
             
+            // Stop the loop and drain remaining queued samples synchronously
+            stopEncodingLoop()
+            assetWriteQueue.sync { [unowned self] in
+                // Drain any remaining items
+                while !(videoQueue.isEmpty) || !(audioQueue.isEmpty) {
+                    drainQueues()
+                    // If inputs are not ready, break to avoid infinite loops
+                    if !(videoWriterInput?.isReadyForMoreMediaData ?? false) && !(audioWriterInput?.isReadyForMoreMediaData ?? false) {
+                        break
+                    }
+                }
+            }
+
             audioWriterInput?.markAsFinished()
             videoWriterInput?.markAsFinished()
-            #if DEBUG
-            print("marked as finished")
-            #endif
+
+            // Clear any leftover items
+            videoQueue.removeAll()
+            audioQueue.removeAll()
             
             @Sendable func processErroringOut(){
                 Task {@MainActor [weak self] in
@@ -350,6 +394,8 @@ class CameraController: NSObject, @unchecked Sendable {
                     print("called finishWriting \(String(describing: self?.outputFileLocation))")
 #endif
                     self!.recordingStartTime = 0
+                    self!.didStartSession = false
+                    self!.sessionStartPTS = .invalid
 
                     if self!.videoWriter!.status != .completed {
 #if DEBUG
@@ -435,10 +481,12 @@ class CameraController: NSObject, @unchecked Sendable {
             
             videoWriterInput?.expectsMediaDataInRealTime = true
             
-            let sourceBufferAttributes = [
-                (kCVPixelBufferPixelFormatTypeKey as String): Int(kCVPixelFormatType_32ARGB),
-                (kCVPixelBufferWidthKey as String): Float(frameWidth),
-                (kCVPixelBufferHeightKey as String): Float(frameHeight)] as [String : Any]
+            let sourceBufferAttributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: frameWidth,
+                kCVPixelBufferHeightKey as String: frameHeight,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ]
             
             pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(
                 assetWriterInput: videoWriterInput!,
@@ -451,6 +499,13 @@ class CameraController: NSObject, @unchecked Sendable {
 #if DEBUG
                 print("no input added")
 #endif
+            }
+            
+            // Apply portrait transform if needed
+            if isPortrait {
+                videoWriterInput?.transform = CGAffineTransform(rotationAngle: .pi / 2)
+            } else {
+                videoWriterInput?.transform = .identity
             }
             
             // add audio input
@@ -471,236 +526,216 @@ class CameraController: NSObject, @unchecked Sendable {
             }
             
             videoWriter?.startWriting()
-            videoWriter?.startSession(atSourceTime: CMTime.init(seconds: CACurrentMediaTime(), preferredTimescale: 1))
-            recordingStartTime = CACurrentMediaTime()
+            // Defer starting the session until first video sample
+            didStartSession = false
+            sessionStartPTS = .invalid
+            basePTS = .invalid
+            frameIndex = 0
+            
             recorded = 0
             timeScale = 60
+            
+            if let formatDesc = frontCamera?.activeFormat.formatDescription {
+                let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
+                // keep existing width/height but try to infer nominal fps
+                if let range = frontCamera?.activeVideoMinFrameDuration, range.timescale != 0 {
+                    nominalFrameDuration = range
+                } else {
+                    nominalFrameDuration = CMTime(value: 1, timescale: 30)
+                }
+                // Ensure adaptor attributes match current dimensions
+                frameWidth = Int(dims.width)
+                frameHeight = Int(dims.height)
+            }
         } catch let error {
 #if DEBUG
             debugPrint(error.localizedDescription)
 #endif
         }
     }
+    
+    private func startEncodingLoop() {
+        guard !encodingActive else { return }
+        encodingActive = true
+
+        // Reset timing
+        basePTS = .invalid
+        frameIndex = 0
+
+        let timer = DispatchSource.makeTimerSource(queue: assetWriteQueue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(5), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            self?.drainQueues()
+        }
+        timer.resume()
+        encodingTimer = timer
+    }
+
+    private func stopEncodingLoop() {
+        encodingActive = false
+        encodingTimer?.cancel()
+        encodingTimer = nil
+    }
+
+    private func enqueueVideo(_ sampleBuffer: CMSampleBuffer) {
+        // Perform stylization off the capture thread
+        prepareQueue.async { [unowned self] in
+            guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+            // Stylize once
+            let stylised = self.stylizeFrame(imageBuffer)
+            let outBuf: CVPixelBuffer
+            if let b = stylised.buf {
+                outBuf = b
+            } else {
+                outBuf = imageBuffer
+            }
+
+            // Update preview with stylized image if available, else fallback
+            if let ui = stylised.ui {
+                DispatchQueue.main.async { [weak self] in
+                    self?.didOutputNewImage(ui)
+                }
+            } else {
+                let ci = CIImage(cvPixelBuffer: imageBuffer)
+                let ui = UIImage(ciImage: ci)
+                DispatchQueue.main.async { [weak self] in
+                    self?.didOutputNewImage(ui)
+                }
+            }
+
+            // If recording, enqueue the stylized buffer for encoding
+            if self.isRecording {
+                if self.videoQueue.count >= self.videoQueueMaxCount {
+                    _ = self.videoQueue.removeFirst()
+                }
+                let queued = QueuedVideoSample(pixelBuffer: outBuf, sampleBuffer: sampleBuffer, previewImage: stylised.ui)
+                self.videoQueue.append(queued)
+            }
+        }
+    }
+
+    private func enqueueAudio(_ sampleBuffer: CMSampleBuffer) {
+        guard isRecording else { return }
+        if !didStartSession { return }
+        if audioQueue.count >= audioQueueMaxCount {
+            _ = audioQueue.removeFirst()
+        }
+        audioQueue.append(sampleBuffer)
+    }
+    
+    private func render(ciImage: CIImage, into pixelBuffer: CVPixelBuffer) {
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        ciContext.render(ciImage, to: pixelBuffer)
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+    }
+
+    private func drainQueues() {
+        guard canWrite(), encodingActive else { return }
+
+        // Ensure inputs are ready before attempting appends
+        let canPushVideo = videoWriterInput?.isReadyForMoreMediaData ?? false
+        let canPushAudio = audioWriterInput?.isReadyForMoreMediaData ?? false
+
+        // Process at most a few items per tick to keep latency bounded
+        var processedVideo = 0
+        var processedAudio = 0
+
+        // Video
+        if canPushVideo {
+            while processedVideo < 4, !videoQueue.isEmpty {
+                let queued = videoQueue.removeFirst()
+                processVideoSample(queued)
+                processedVideo += 1
+            }
+        }
+
+        // Audio
+        if canPushAudio {
+            while processedAudio < 8, !audioQueue.isEmpty {
+                let sampleBuffer = audioQueue.removeFirst()
+                processAudioSample(sampleBuffer)
+                processedAudio += 1
+            }
+        }
+    }
+
+    private func processVideoSample(_ queued: QueuedVideoSample) {
+        let sampleBuffer = queued.sampleBuffer
+        let outBuf = queued.pixelBuffer
+
+        // Prefer the sample buffer PTS; fall back to monotonic frame count
+        let samplePTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let pts: CMTime
+        if samplePTS.isValid {
+            if !basePTS.isValid { basePTS = samplePTS }
+            pts = samplePTS
+        } else {
+            if !basePTS.isValid { basePTS = .zero; frameIndex = 0 }
+            pts = CMTimeAdd(basePTS, CMTimeMultiply(nominalFrameDuration, multiplier: Int32(frameIndex)))
+            frameIndex += 1
+        }
+        
+        // Start writer session at first video PTS
+        if !didStartSession {
+            if pts.isValid {
+                videoWriter?.startSession(atSourceTime: pts)
+                sessionStartPTS = pts
+                didStartSession = true
+            }
+        }
+
+        // Ensure buffer matches adaptor's pixel format and size by rendering into pool buffer
+        guard let adaptor = pixelBufferAdaptor, let pool = adaptor.pixelBufferPool else { return }
+        var poolBufferOpt: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &poolBufferOpt)
+        if status != kCVReturnSuccess { return }
+        guard let poolBuffer = poolBufferOpt else { return }
+
+        // Create CIImage from the stylized buffer and render into pool buffer
+        let ci = CIImage(cvPixelBuffer: outBuf)
+        render(ciImage: ci, into: poolBuffer)
+
+        writerLock.lock()
+        let success = adaptor.append(poolBuffer, withPresentationTime: pts)
+        writerLock.unlock()
+
+        if !success {
+            Task { @MainActor [weak self] in
+                if !(self?.showError ?? false) {
+                    self?.erroredOut = true
+                    self?.showError = true
+                }
+            }
+        }
+    }
+
+    private func processAudioSample(_ sampleBuffer: CMSampleBuffer) {
+        // Only append audio after the session has started with first video frame
+        guard didStartSession else { return }
+        writerLock.lock()
+        let ok = audioWriterInput?.append(sampleBuffer) ?? false
+        writerLock.unlock()
+        if !ok {
+            Task { @MainActor [weak self] in
+                if !(self?.showError ?? false) {
+                    self?.erroredOut = true
+                    self?.showError = true
+                }
+            }
+        }
+    }
 }
 
 //MARK: - Sample buffer delegates
-extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate  {
-    private var VIDEO_WAIT_TIMER: Int {return 10_000_000_000}
-    private var VIDEO_RETRIES: Int {return 10}
-    
-    private var AUDIO_WAIT_TIMER: Int {return 10_000_000_000}
-    private var AUDIO_RETRIES: Int {return 10}
-
-    private func recordFrame(_ output: AVCaptureOutput, _ sampleBuffer: CMSampleBuffer, _ toDisplay: Bool) -> Bool {
-        
-        var retVal = false
-        
-        @Sendable func setRetVal(_ newVal: Bool) {
-            Task {@MainActor in
-                retVal = newVal
-            }
-        }
-
-        retVal = autoreleasepool {
-            guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return false }
-            
-            let stylised = self.stylizeFrame(imageBuffer)
-            let image = stylised.ui
-            let ciImage = CIImage(cvPixelBuffer: stylised.buf ?? imageBuffer)
-            guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return false }
-            
-            //MARK: - AVWriteAsset stuff
-            let writable = self.canWrite()
-            if writable, output == self.cameraOutput {
-                
-                if isRecording {
-                    assetWriteQueue.async {[unowned self] in // We don't want our waiting for isReadyForMoreMediaData to interfere with the incoming frames, so we put it on a different thread
-                        if let pixelBufferPool = self.pixelBufferAdaptor?.pixelBufferPool {
-                            
-                            let pixelBufferPointer = UnsafeMutablePointer<CVPixelBuffer?>.allocate(capacity: 1)
-                            let status: CVReturn = CVPixelBufferPoolCreatePixelBuffer(
-                                kCFAllocatorDefault,
-                                pixelBufferPool,
-                                pixelBufferPointer
-                            )
-                            
-                            if (status == 0) {
-                                for _ in 0...VIDEO_WAIT_TIMER { // Wait for the writer to become accessible: not forever (not 'while true'), because this task isn't cancellable
-                                    if let ready = self.pixelBufferAdaptor?.assetWriterInput.isReadyForMoreMediaData, let session = self.captureSession {
-                                        if ready && session.isRunning {
-                                            let frameBuf = stylised.buf
-                                            
-                                            self.frames += 1
-                                            
-                                            let recordingTime = CACurrentMediaTime() - recordingStartTime
-                                            let realFrameDuration = recordingTime / Double(frames)
-                                            
-                                            let presentationTime = CMTime.init(seconds: recordingStartTime, preferredTimescale: 1) + CMTimeMake(value: frames, timescale: Int32(1.0 / realFrameDuration))
-                                            
-                                            writerLock.lock() // The extra insurance
-                                            prepareQueue.sync { // Writing to the pixel buffer adaptor MUST happen on ONE AND THE SAME THREAD!!!
-                                                var bErroredOut = false // Whether or not we want to show the error message in the UI
-                                                for _ in  0...VIDEO_RETRIES { // If the writing has failed, we retry VIDEO_RETRIES times
-                                                    guard let appendSucceeded = self.pixelBufferAdaptor?.append(
-                                                        frameBuf!,
-                                                        withPresentationTime: presentationTime
-                                                    ) else {fatalError("Could not append a buffer to the buffer adaptor")}
-                                                    
-                                                    if appendSucceeded {
-                                                        bErroredOut = false
-                                                        setRetVal(true)
-                                                        break
-                                                    } else {
-                                                        if let error = self.videoWriter?.error {
-#if DEBUG
-                                                            print("something's wrong (video): \(error.localizedDescription)")
-                                                            let status = switch self.videoWriter!.status {
-                                                            case .completed: "status: completed"
-                                                            case .writing: "status: writing"
-                                                            case .cancelled: "status: cancelled"
-                                                            case .failed: "status: failed"
-                                                            case .unknown: "status: unknown"
-                                                            default: "status: Undocumented"
-                                                            }
-                                                            print(status)
-#endif
-                                                            bErroredOut = self.videoWriter!.status != .writing
-                                                            if (self.videoWriter!.status != .failed && self.videoWriter!.status != .writing) ||
-                                                                self.videoWriter!.status == .writing {
-                                                                break
-                                                            }
-                                                        }
-                                                        else {
-#if DEBUG
-                                                            print("something's wrong (video)")
-#endif
-                                                            bErroredOut = true
-                                                            break
-                                                        }
-                                                    }
-                                                }
-                                                
-                                                if bErroredOut {
-                                                    Task {@MainActor [weak self] in
-                                                        if !(self?.showError ?? false) {
-                                                            self?.erroredOut = true
-                                                            self?.showError = true
-                                                        }
-                                                    }
-                                                }
-                                            }//prepareQueue.sync
-                                            writerLock.unlock()
-                                            
-                                            break // for _ in 0...10_000_000_000
-                                        }
-                                        else if !session.isRunning {
-                                            break // for _ in 0...10_000_000_000
-                                        }
-                                        break // for _ in 0...10_000_000_000
-                                    }
-                                }
-                            }
-                            else {
-#if DEBUG
-                                print("Could not allocate pixel buffer")
-#endif
-                                Task {@MainActor [weak self] in
-                                    if !(self?.showError ?? false) {
-                                        self?.erroredOut = true
-                                        self?.showError = true
-                                    }
-                                }
-                            }
-                            pixelBufferPointer.deinitialize(count: 1)
-                            pixelBufferPointer.deallocate()
-                        }
-                    }
-                }
-            }
-            
-            DispatchQueue.main.async {[unowned self] in
-                if toDisplay {
-                    // the final picture is here, we call the completion block
-                    let toShow = image
-                    let cg  = cgImage
-                    self.didOutputNewImage(toShow ?? UIImage(cgImage: cg))
-                }
-            }
-            return retVal
-        }// autoreleasepool
-
-        return retVal
-    }
-    
+extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         if output == cameraOutput {
-            if recordFrame(output, sampleBuffer, true) {
-                frames += 1
-            }
-        }
-        else {
-            // Audio data?
-            if canWrite() && output == mikeOutput {
-                assetWriteQueue.async {[unowned self] in // We don't want our waiting for isReadyForMoreMediaData to interfere with the incoming frames, so we put it on a different thread
-                    for _ in 0...AUDIO_WAIT_TIMER { // Wait for the writer to become accessible: not forever (not 'while true'), because this task isn't cancellable
-                        if let isReady = (audioWriterInput?.isReadyForMoreMediaData), isReady, let session = self.captureSession, session.isRunning {
-                            // write audio buffer
-                            writerLock.lock() // The extra insurance
-                            prepareQueue.sync {// Appending the sample buffer MUST happen on ONE AND THE SAME THREAD!!!
-                                // If the writing has failed, we retry 10 times
-                                var bErroredOut = false  // Whether or not we want to show the error message in the UI
-                                for _ in 0...AUDIO_RETRIES {
-                                    if let success = self.audioWriterInput?.append(sampleBuffer) {
-                                        if !success {
-                                            if let error = self.videoWriter?.error {
-#if DEBUG
-                                                print("something's wrong (audio): \(error.localizedDescription)")
-                                                let status = switch self.videoWriter!.status {
-                                                case .completed: "status: completed"
-                                                case .writing: "status: writing"
-                                                case .cancelled: "status: cancelled"
-                                                case .failed: "status: failed"
-                                                case .unknown: "status: unknown"
-                                                default: "status: Undocumented"
-                                                }
-                                                print(status)
-#endif
-                                                bErroredOut = self.videoWriter!.status != .writing
-                                                if (self.videoWriter!.status != .failed && self.videoWriter!.status != .writing) ||  
-                                                    self.videoWriter!.status == .writing {
-                                                    break
-                                                }
-                                            }
-                                            else {
-#if DEBUG
-                                                print("something's wrong (audio)")
-#endif
-                                                bErroredOut  = true
-                                                break
-                                            }
-                                        }
-                                        else {
-                                            // We've successfully recored the frame: no more looping
-                                            bErroredOut = false
-                                            break
-                                        }
-                                    }
-                                }
-                                
-                                if bErroredOut {
-                                    Task{@MainActor [weak self] in
-                                        if !(self?.showError ?? false) {
-                                            self?.erroredOut = true
-                                            self?.showError = true
-                                        }
-                                    }
-                                }
-                            }
-                            writerLock.unlock()
-                            break
-                        }
-                    }
-                }
+            // Enqueue; preview will be updated after stylization inside enqueueVideo
+            enqueueVideo(sampleBuffer)
+        } else if output == mikeOutput {
+            if isRecording {
+                enqueueAudio(sampleBuffer)
             }
         }
     }
@@ -711,3 +746,4 @@ extension CameraController:  AVCaptureAudioDataOutputSampleBufferDelegate {
 }
 
 extension CMSampleBuffer: @unchecked @retroactive Sendable {}
+
