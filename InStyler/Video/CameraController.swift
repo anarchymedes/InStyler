@@ -13,6 +13,8 @@ import Vision
 import VisionKit
 import SwiftUI
 import Accelerate
+import CoreImage
+import CoreGraphics
 
 struct FancyImage: @unchecked Sendable {
     var ui: UIImage?
@@ -23,7 +25,7 @@ protocol CameraControllerUIDelegate {
     func inErrorState(_: Bool)
 }
 
-class CameraController: NSObject, @unchecked Sendable {
+class CameraController: NSObject, @unchecked Sendable, PreviewOrienting {
     var captureSession: AVCaptureSession?
     var frontCamera: AVCaptureDevice?
     var frontCameraInput: AVCaptureDeviceInput?
@@ -61,6 +63,9 @@ class CameraController: NSObject, @unchecked Sendable {
 
     // CI context for rendering
     private let ciContext = CIContext(options: nil)
+    
+    // For preview orientation delegation
+    private let previewOrienter: PreviewOrienting = DefaultPreviewOrienter()
 
     // Queued video sample carrying stylized buffer and timing
     private struct QueuedVideoSample {
@@ -96,6 +101,8 @@ class CameraController: NSObject, @unchecked Sendable {
     private var erroredOut = false
     
     var chachedBuffer: CVPixelBuffer? = nil
+    
+    private var acceptingSamples: Bool = true
     
     enum CameraControllerError: Swift.Error {
         case captureSessionAlreadyRunning
@@ -165,6 +172,10 @@ class CameraController: NSObject, @unchecked Sendable {
         
         let rc = AVCaptureDevice.RotationCoordinator(device: self.frontCamera!, previewLayer: nil)
         return (rc.videoRotationAngleForHorizonLevelCapture, rc.device?.isPortraitEffectActive ?? false)
+    }
+    
+    func orientedPreviewImage(_ image: CIImage, angleDegrees: CGFloat, mirrored: Bool, targetSize: CGSize) -> CIImage {
+        return previewOrienter.orientedPreviewImage(image, angleDegrees: angleDegrees, mirrored: mirrored, targetSize: targetSize)
     }
 
     //MARK: - Prepare method
@@ -246,6 +257,8 @@ class CameraController: NSObject, @unchecked Sendable {
                 self.mikeOutput = AVCaptureAudioDataOutput()
                 self.mikeOutput!.setSampleBufferDelegate(self, queue: DispatchQueue(label: "sample buffer"))
                 
+                self.acceptingSamples = true
+                
                 if (self.captureSession != nil)
                 {
                     // always make sure the AVCaptureSession can accept the selected output
@@ -314,6 +327,8 @@ class CameraController: NSObject, @unchecked Sendable {
             
             frames = 0
             
+            self.acceptingSamples = true
+            
             isRecording = true
             
             setUpWriter()
@@ -342,13 +357,19 @@ class CameraController: NSObject, @unchecked Sendable {
         
         prepareQueue.asyncAndWait {[unowned self] in
             
-            // Stop the loop and drain remaining queued samples synchronously
+            self.acceptingSamples = false
+            self.cameraOutput?.setSampleBufferDelegate(nil, queue: nil)
+            self.mikeOutput?.setSampleBufferDelegate(nil, queue: nil)
+            
+            // Remove manual draining and capture session stop to avoid UI freeze
+            /*
             stopEncodingLoop()
             assetWriteQueue.sync { [unowned self] in
-                // Drain any remaining items
-                while !(videoQueue.isEmpty) || !(audioQueue.isEmpty) {
+                // Drain remaining items opportunistically without spinning forever
+                var iterations = 0
+                while ( !(videoQueue.isEmpty) || !(audioQueue.isEmpty) ) && iterations < 100 {
                     drainQueues()
-                    // If inputs are not ready, break to avoid infinite loops
+                    iterations += 1
                     if !(videoWriterInput?.isReadyForMoreMediaData ?? false) && !(audioWriterInput?.isReadyForMoreMediaData ?? false) {
                         break
                     }
@@ -358,6 +379,20 @@ class CameraController: NSObject, @unchecked Sendable {
             audioWriterInput?.markAsFinished()
             videoWriterInput?.markAsFinished()
 
+            if self.captureSession?.isRunning == true {
+                self.captureSession?.stopRunning()
+            }
+            
+            // Clear any leftover items
+            videoQueue.removeAll()
+            audioQueue.removeAll()
+            */
+            
+            // Mark inputs finished and clear queues now
+            stopEncodingLoop()
+            audioWriterInput?.markAsFinished()
+            videoWriterInput?.markAsFinished()
+            
             // Clear any leftover items
             videoQueue.removeAll()
             audioQueue.removeAll()
@@ -376,6 +411,11 @@ class CameraController: NSObject, @unchecked Sendable {
                     guard self != nil else {
                         return
                     }
+                    
+                    // Reattach delegates and resume preview acceptance
+                    self!.acceptingSamples = true
+                    self!.cameraOutput?.setSampleBufferDelegate(self, queue: DispatchQueue(label: "sample buffer"))
+                    self!.mikeOutput?.setSampleBufferDelegate(self, queue: DispatchQueue(label: "sample buffer"))
                     
 #if DEBUG
                     func pringVideoWriterStatus() {
@@ -580,6 +620,7 @@ class CameraController: NSObject, @unchecked Sendable {
     private func enqueueVideo(_ sampleBuffer: CMSampleBuffer) {
         // Perform stylization off the capture thread
         prepareQueue.async { [unowned self] in
+            guard self.isRecording || self.acceptingSamples else { return }
             guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
             // Stylize once
@@ -591,20 +632,7 @@ class CameraController: NSObject, @unchecked Sendable {
                 outBuf = imageBuffer
             }
 
-            // Update preview with stylized image if available, else fallback
-            if let ui = stylised.ui {
-                DispatchQueue.main.async { [weak self] in
-                    self?.didOutputNewImage(ui)
-                }
-            } else {
-                let ci = CIImage(cvPixelBuffer: imageBuffer)
-                let ui = UIImage(ciImage: ci)
-                DispatchQueue.main.async { [weak self] in
-                    self?.didOutputNewImage(ui)
-                }
-            }
-
-            // If recording, enqueue the stylized buffer for encoding
+            // If recording, enqueue the stylized buffer for encoding ASAP to avoid blocking the writer start
             if self.isRecording {
                 if self.videoQueue.count >= self.videoQueueMaxCount {
                     _ = self.videoQueue.removeFirst()
@@ -612,11 +640,62 @@ class CameraController: NSObject, @unchecked Sendable {
                 let queued = QueuedVideoSample(pixelBuffer: outBuf, sampleBuffer: sampleBuffer, previewImage: stylised.ui)
                 self.videoQueue.append(queued)
             }
+
+            // Update preview with stylized image if available, else fallback
+            if let ui = stylised.ui {
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self = self else { return }
+                    autoreleasepool {
+                        // Create CIImage from stylized buffer if available, else from UIImage
+                        let baseCI: CIImage
+                        if let buf = stylised.buf {
+                            baseCI = CIImage(cvPixelBuffer: buf)
+                        } else {
+                            baseCI = CIImage(image: ui) ?? CIImage()
+                        }
+                        // Connection already rotated frames; avoid double-rotation.
+                        let effectiveAngle: CGFloat = 0
+                        let mirrored = self.useFront
+                        let isPortraitLike = self.isPortrait
+                        let target = isPortraitLike ? CGSize(width: CGFloat(min(self.frameWidth, self.frameHeight)),
+                                                             height: CGFloat(max(self.frameWidth, self.frameHeight)))
+                                                    : CGSize(width: CGFloat(max(self.frameWidth, self.frameHeight)),
+                                                             height: CGFloat(min(self.frameWidth, self.frameHeight)))
+                        let orientedCI = self.orientedPreviewImage(baseCI, angleDegrees: effectiveAngle, mirrored: mirrored, targetSize: target)
+                        let cg = self.ciContext.createCGImage(orientedCI, from: orientedCI.extent)
+                        let orientedUI = cg.map { UIImage(cgImage: $0) } ?? ui
+                        DispatchQueue.main.async { [weak self] in
+                            self?.didOutputNewImage(orientedUI)
+                        }
+                    }
+                }
+            }
+            else {
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self = self else { return }
+                    autoreleasepool {
+                        let baseCI = CIImage(cvPixelBuffer: imageBuffer)
+                        let effectiveAngle: CGFloat = 0
+                        let mirrored = self.useFront
+                        let isPortraitLike = self.isPortrait
+                        let target = isPortraitLike ? CGSize(width: CGFloat(min(self.frameWidth, self.frameHeight)),
+                                                             height: CGFloat(max(self.frameWidth, self.frameHeight)))
+                                                    : CGSize(width: CGFloat(max(self.frameWidth, self.frameHeight)),
+                                                             height: CGFloat(min(self.frameWidth, self.frameHeight)))
+                        let orientedCI = self.orientedPreviewImage(baseCI, angleDegrees: effectiveAngle, mirrored: mirrored, targetSize: target)
+                        let cg = self.ciContext.createCGImage(orientedCI, from: orientedCI.extent)
+                        let ui = cg.map { UIImage(cgImage: $0) } ?? UIImage(ciImage: baseCI)
+                        DispatchQueue.main.async { [weak self] in
+                            self?.didOutputNewImage(ui)
+                        }
+                    }
+                }
+            }
         }
     }
 
     private func enqueueAudio(_ sampleBuffer: CMSampleBuffer) {
-        guard isRecording else { return }
+        guard isRecording && acceptingSamples else { return }
         if !didStartSession { return }
         if audioQueue.count >= audioQueueMaxCount {
             _ = audioQueue.removeFirst()
@@ -636,6 +715,8 @@ class CameraController: NSObject, @unchecked Sendable {
         // Ensure inputs are ready before attempting appends
         let canPushVideo = videoWriterInput?.isReadyForMoreMediaData ?? false
         let canPushAudio = audioWriterInput?.isReadyForMoreMediaData ?? false
+
+        if !canPushVideo && !canPushAudio { return }
 
         // Process at most a few items per tick to keep latency bounded
         var processedVideo = 0
@@ -730,6 +811,7 @@ class CameraController: NSObject, @unchecked Sendable {
 //MARK: - Sample buffer delegates
 extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        if !acceptingSamples { return }
         if output == cameraOutput {
             // Enqueue; preview will be updated after stylization inside enqueueVideo
             enqueueVideo(sampleBuffer)

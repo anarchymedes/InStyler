@@ -8,11 +8,15 @@
 //
 @preconcurrency import AVFoundation
 import CoreImage
+import CoreGraphics
 import UIKit
 import SwiftUI
 
 class PhotoCamera: NSObject, @unchecked Sendable {
     @AppStorage("chosenStyle") var chosenStyle: Int?
+    
+    // Strategy for orienting and scaling preview frames
+    var previewOrienter: PreviewOrienting = DefaultPreviewOrienter()
     
     private let captureSession = AVCaptureSession()
     private var isCaptureSessionConfigured = false
@@ -241,36 +245,6 @@ class PhotoCamera: NSObject, @unchecked Sendable {
         }
     }
     
-    // Apply rotation/mirroring and aspect-fit to target preview size
-    private func orientedPreviewImage(_ image: CIImage, angleDegrees: CGFloat, mirrored: Bool, targetSize: CGSize) -> CIImage {
-        var ci = image
-        // Rotate around center
-        let center = CGPoint(x: ci.extent.midX, y: ci.extent.midY)
-        let radians = -angleDegrees * .pi / 180
-        ci = ci
-            .transformed(by: CGAffineTransform(translationX: -center.x, y: -center.y))
-            .transformed(by: CGAffineTransform(rotationAngle: radians))
-            .transformed(by: CGAffineTransform(translationX: center.x, y: center.y))
-
-        // Mirror horizontally if needed
-        if mirrored {
-            ci = ci
-                .transformed(by: CGAffineTransform(translationX: ci.extent.width, y: 0))
-                .transformed(by: CGAffineTransform(scaleX: -1, y: 1))
-        }
-
-        // Aspect-fit into target size
-        let sx = targetSize.width / max(ci.extent.width, 1)
-        let sy = targetSize.height / max(ci.extent.height, 1)
-        let scale = min(sx, sy)
-        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-
-        // Center within target rect (letterbox/pillarbox)
-        let tx = (targetSize.width - scaled.extent.width) * 0.5
-        let ty = (targetSize.height - scaled.extent.height) * 0.5
-        return scaled.transformed(by: CGAffineTransform(translationX: tx, y: ty))
-    }
-    
     private func bestMaxPhotoDimensions(for device: AVCaptureDevice) -> CMVideoDimensions {
         let format = device.activeFormat
         let desc = format.formatDescription
@@ -420,7 +394,7 @@ extension PhotoCamera: AVCaptureVideoDataOutputSampleBufferDelegate {
         let angle = orientation.0 ?? 0
         let mirrored = self.isUsingFrontCaptureDevice
         let baseImage = stylizeFrame(pixelBuffer) ?? CIImage(cvPixelBuffer: pixelBuffer)
-        let oriented = orientedPreviewImage(baseImage, angleDegrees: angle, mirrored: mirrored, targetSize: previewTargetSize)
+        let oriented = previewOrienter.orientedPreviewImage(baseImage, angleDegrees: angle, mirrored: mirrored, targetSize: previewTargetSize)
         addToPreviewStream?(oriented)
     }
 }
